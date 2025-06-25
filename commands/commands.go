@@ -2,12 +2,18 @@ package commands
 
 import (
 	"fmt"
+	"io"
+	"io/fs"
+	"os"
 	"slices"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/term"
 )
 
 type CmdFunc = func(parent *Cmd, args []string) tea.Model
@@ -19,19 +25,45 @@ type Cmd struct {
 	Description string
 	Commands    []*Cmd
 	Run         CmdFunc
+	help        string
 	parent      *Cmd
 }
 
-func NewRoot(cmds ...*Cmd) *Cmd {
+func NewRoot(helpFS fs.FS, cmds ...*Cmd) (*Cmd, error) {
 	r := &Cmd{Commands: cmds, isRoot: true}
-	r.setParents()
-	return r
+	setParents(r)
+	if err := loadHelp(helpFS, "help", r); err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
-func (c *Cmd) setParents() {
+func loadHelp(helpFS fs.FS, path string, cmd *Cmd) error {
+	if len(cmd.Commands) == 0 {
+		f, err := helpFS.Open(path + ".md")
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		b, err := io.ReadAll(f)
+		if err != nil {
+			return err
+		}
+		cmd.help = string(b)
+		return nil
+	}
+	for _, c := range cmd.Commands {
+		if err := loadHelp(helpFS, path+"/"+c.Name, c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func setParents(c *Cmd) {
 	for _, cmd := range c.Commands {
 		cmd.parent = c
-		cmd.setParents()
+		setParents(cmd)
 	}
 }
 
@@ -90,17 +122,17 @@ func (c *Cmd) table(isHelp bool) table.Model {
 	return t
 }
 
-type model struct {
+type menu struct {
 	table  table.Model
 	cmd    *Cmd
 	isHelp bool
 }
 
-func (m model) Init() tea.Cmd {
+func (m menu) Init() tea.Cmd {
 	return nil
 }
 
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m menu) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -108,21 +140,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			selected := m.table.SelectedRow()
 			if selected[0] == ".." {
 				parent := m.cmd.parent
-				return model{cmd: parent, isHelp: m.isHelp, table: parent.table(m.isHelp)}, nil
+				return menu{cmd: parent, isHelp: m.isHelp, table: parent.table(m.isHelp)}, nil
 			}
 			for _, c := range m.cmd.Commands {
 				if c.Name == selected[0] {
 					if c.Run != nil {
-						args := make([]string, 0, 1)
 						if m.isHelp {
-							args = append(args, "-h")
+							hv, err := newHelpView(c, true)
+							if err != nil {
+								panic(err)
+							}
+							return hv, nil
 						}
-						return c.Run(c.parent, args), nil
+						return c.Run(c.parent, []string{}), nil
 					}
-					return model{cmd: c, isHelp: m.isHelp, table: c.table(m.isHelp)}, nil
+					return menu{cmd: c, isHelp: m.isHelp, table: c.table(m.isHelp)}, nil
 				}
 			}
-		case "q", "esc":
+		case "q", "esc", "ctrl+c":
 			return m, tea.Quit
 		}
 	}
@@ -131,7 +166,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m model) View() string {
+func (m menu) View() string {
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderForeground(lipgloss.Color("240")).
@@ -157,7 +192,7 @@ func newTeaProgram(model tea.Model) error {
 
 func Run(rootCmd *Cmd, args []string) error {
 	if len(args) == 0 {
-		return newTeaProgram(model{cmd: rootCmd, table: rootCmd.table(false)})
+		return newTeaProgram(menu{cmd: rootCmd, table: rootCmd.table(false)})
 	}
 	if args[0] == "help" || args[0] == "h" {
 		cmd, _, err := findCommand(rootCmd, args[1:])
@@ -165,9 +200,13 @@ func Run(rootCmd *Cmd, args []string) error {
 			return err
 		}
 		if cmd.Run != nil {
-			return newTeaProgram(cmd.Run(cmd.parent, []string{"-h"}))
+			hv, err := newHelpView(cmd, false)
+			if err != nil {
+				return err
+			}
+			return newTeaProgram(hv)
 		}
-		return newTeaProgram(model{cmd: cmd, isHelp: true, table: cmd.table(true)})
+		return newTeaProgram(menu{cmd: cmd, isHelp: true, table: cmd.table(true)})
 	}
 	cmd, args, err := findCommand(rootCmd, args)
 	if err != nil {
@@ -176,5 +215,74 @@ func Run(rootCmd *Cmd, args []string) error {
 	if cmd.Run != nil {
 		return newTeaProgram(cmd.Run(cmd.parent, args))
 	}
-	return newTeaProgram(model{cmd: cmd, table: cmd.table(false)})
+	return newTeaProgram(menu{cmd: cmd, table: cmd.table(false)})
+}
+
+type helpView struct {
+	viewport  viewport.Model
+	cmd       *Cmd
+	canGoBack bool
+}
+
+func renderMarkdown(content string, width int) (string, error) {
+	r, err := glamour.NewTermRenderer(
+		glamour.WithWordWrap(width),
+		glamour.WithStandardStyle("dark"),
+	)
+	if err != nil {
+		return "", err
+	}
+	return r.Render(content)
+}
+
+func newHelpView(cmd *Cmd, canGoBack bool) (helpView, error) {
+	w, h, err := term.GetSize(os.Stdout.Fd())
+	if err != nil {
+		return helpView{}, err
+	}
+	out, err := renderMarkdown(cmd.help, w)
+	if err != nil {
+		return helpView{}, err
+	}
+	vp := viewport.New(w, h)
+	vp.SetContent(out)
+	vp.KeyMap = viewport.DefaultKeyMap()
+	vp.MouseWheelEnabled = true
+	return helpView{viewport: vp, cmd: cmd, canGoBack: canGoBack}, nil
+}
+
+func (hv helpView) Init() tea.Cmd { return nil }
+
+func (hv helpView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "b", "esc":
+			if hv.canGoBack {
+				parent := hv.cmd.parent
+				return menu{cmd: parent, isHelp: true, table: parent.table(true)}, nil
+			}
+		case "q", "ctrl+c":
+			return hv, tea.Quit
+		}
+	case tea.WindowSizeMsg:
+		rendered, err := renderMarkdown(hv.cmd.help, msg.Width)
+		if err != nil {
+			panic(err)
+		}
+		hv.viewport = viewport.New(msg.Width, hv.viewport.Height)
+		hv.viewport.SetContent(rendered)
+	}
+	hv.viewport, cmd = hv.viewport.Update(msg)
+	return hv, cmd
+}
+
+func (hv helpView) View() string {
+	msg := "\n["
+	if hv.canGoBack {
+		msg += "b to go back, "
+	}
+	msg += "q to exit]"
+	return hv.viewport.View() + msg
 }
